@@ -19,11 +19,23 @@
 
 ## نصب
 
+روی هر دو سرور (ایران و خارج) با کاربر root اجرا کنید:
+
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/xmohammad1/GRE-Tunnel/refs/heads/main/gre-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/xmohammad1/GRE-Tunnel/main/gre-manager.sh)
 ```
 
-اولین اجرا اسکریپت را در `/usr/local/bin/gre-manager` نصب می‌کند؛ از آن به بعد کافی است `sudo gre-manager` بزنید.
+اسکریپت خودش را در `/usr/local/bin/gre-manager` نصب می‌کند؛ از آن به بعد کافی است `gre-manager` بزنید.
+
+اگر سرور به GitHub دسترسی ندارد، فایل `gre-manager.sh` را دستی روی سرور کپی کنید و `sudo bash gre-manager.sh` را اجرا کنید.
+
+### آپدیت
+
+```bash
+gre-manager update
+```
+
+یا گزینه **13) Update** در منو. آپدیت روی تانل‌های فعال اثری ندارد و هیچ‌وقت نسخه قدیمی‌تر را جایگزین نسخه جدیدتر نمی‌کند.
 نیازمندی‌ها (iproute2، iptables، ping، curl) در صورت نبودن خودکار نصب می‌شوند. سیستم باید systemd داشته باشد و کرنل از GRE پشتیبانی کند (روی OpenVZ/LXC معمولاً کار نمی‌کند).
 
 ## مثال: یک سرور ایران و دو سرور خارج
@@ -72,6 +84,7 @@ proto:port[-port][>target_port]      proto = tcp | udp | both
 | `gre-manager optimize` | بهینه‌سازی کرنل (BBR) |
 | `gre-manager backup` / `restore <file>` | بکاپ و ریستور |
 | `gre-manager import-legacy` | انتقال تانل اسکریپت قدیمی |
+| `gre-manager update` | دریافت آخرین نسخه از GitHub |
 | `gre-manager uninstall [--purge]` | حذف کامل |
 
 همه گزینه‌های `add` با `gre-manager help` نمایش داده می‌شوند.
