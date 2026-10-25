@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly APP="gre-manager"
 readonly INSTALL_PATH="/usr/local/bin/${APP}"
 readonly CONF_DIR="/etc/${APP}"
@@ -29,6 +29,7 @@ readonly UNIT_TEMPLATE="${SYSTEMD_DIR}/${APP}@.service"
 readonly MONITOR_SERVICE="${SYSTEMD_DIR}/${APP}-monitor.service"
 readonly MONITOR_TIMER="${SYSTEMD_DIR}/${APP}-monitor.timer"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
+readonly SCRIPT_URL="https://raw.githubusercontent.com/xmohammad1/GRE-Tunnel/main/gre-manager.sh"
 
 # Artifacts of the old single-tunnel script (gre2manager.sh).
 readonly LEGACY_SERVICE="gre-tun2"
@@ -269,7 +270,49 @@ detect_public_ip() {
     return 1
 }
 
-# Copies this script to INSTALL_PATH, which the systemd units execute.
+script_version() {
+    sed -n 's/^readonly VERSION="\(.*\)"$/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+version_lt() {
+    [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1) == "$1" ]]
+}
+
+# Fetches the script from GitHub and installs it when it differs from
+# INSTALL_PATH. Returns 1 (with an error message) when the download fails.
+download_self() {
+    local tmp new_ver cur_ver
+    has_cmd curl || pkg_install curl
+    tmp=$(mktemp)
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 "$SCRIPT_URL" -o "$tmp"; then
+        rm -f "$tmp"
+        err "Could not download ${SCRIPT_URL}"
+        return 1
+    fi
+    if [[ $(head -n1 "$tmp") != '#!/usr/bin/env bash' ]] || ! grep -q "^readonly APP=\"${APP}\"$" "$tmp" ||
+        ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        err "The downloaded file is not a valid ${APP} script."
+        return 1
+    fi
+    if cmp -s "$tmp" "$INSTALL_PATH" 2>/dev/null; then
+        rm -f "$tmp"
+        return 0
+    fi
+    new_ver=$(script_version "$tmp")
+    cur_ver=$(script_version "$INSTALL_PATH")
+    if [[ -n $cur_ver ]] && version_lt "$new_ver" "$cur_ver"; then
+        rm -f "$tmp"
+        warn "GitHub has ${APP} ${new_ver}, older than the installed ${cur_ver}; keeping the installed version."
+        return 0
+    fi
+    install -m 0755 "$tmp" "$INSTALL_PATH"
+    rm -f "$tmp"
+    SELF_UPDATED=1
+    ok "Installed ${APP} $(script_version "$INSTALL_PATH") to ${INSTALL_PATH}"
+}
+
+# Puts this script at INSTALL_PATH, which the systemd units execute.
 install_self() {
     local src
     src=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
@@ -280,8 +323,24 @@ install_self() {
             SELF_UPDATED=1
             ok "Installed ${APP} ${VERSION} to ${INSTALL_PATH}"
         fi
-    elif [[ ! -x $INSTALL_PATH ]]; then
-        die "Cannot self-install when run from a pipe. Save the script to a file and run: sudo bash gre-manager.sh"
+    else
+        # Started as "bash <(curl ...)": there is no file to copy, so fetch one.
+        info "Fetching the latest ${APP} from GitHub ..."
+        download_self || [[ -x $INSTALL_PATH ]] ||
+            die "Install manually: curl -fsSL ${SCRIPT_URL} -o ${INSTALL_PATH} && chmod +x ${INSTALL_PATH}"
+    fi
+}
+
+cmd_update() {
+    local before
+    before=$(script_version "$INSTALL_PATH")
+    SELF_UPDATED=0
+    download_self || return 1
+    if [[ $SELF_UPDATED -eq 1 ]]; then
+        write_units
+        ok "Updated ${APP} ${before:-?} -> $(script_version "$INSTALL_PATH")."
+    else
+        ok "${APP} is already up to date (${before})."
     fi
 }
 
@@ -1441,6 +1500,15 @@ ui_logs() {
     journalctl -u "${APP}@*" -u "${APP}-monitor.service" -n 20 --no-pager 2>/dev/null || true
 }
 
+ui_update() {
+    section "Update ${APP}"
+    if cmd_update && [[ $SELF_UPDATED -eq 1 ]]; then
+        info "Restarting the menu with the new version ..."
+        exec "$INSTALL_PATH" menu
+    fi
+    pause
+}
+
 ui_uninstall() {
     section "Uninstall ${APP}"
     confirm "Stop and remove all tunnels, services and the ${APP} command?" n || return 0
@@ -1478,9 +1546,10 @@ main_menu() {
         printf '\n  %sTraffic%s\n' "$C_BOLD" "$C_RESET"
         printf '    7) Port forwarding        8) Connectivity & MTU test\n'
         printf '\n  %sSystem%s\n' "$C_BOLD" "$C_RESET"
-        printf '    9) Health monitor        11) Backup / Restore\n'
-        printf '   10) Kernel optimization   12) Logs\n'
-        printf '   13) Uninstall              0) Exit\n\n'
+        printf '    9) Health monitor        12) Logs\n'
+        printf '   10) Kernel optimization   13) Update %s\n' "$APP"
+        printf '   11) Backup / Restore      14) Uninstall\n'
+        printf '\n    0) Exit\n\n'
         read -r -p "  Select: " choice || exit 0
         case $choice in
             1) run_action ui_add ;;
@@ -1495,7 +1564,8 @@ main_menu() {
             10) run_action ui_optimize ;;
             11) run_action ui_backup ;;
             12) run_action ui_logs ;;
-            13) ui_uninstall ;;
+            13) ui_update ;;
+            14) ui_uninstall ;;
             0 | q | Q) exit 0 ;;
             *) warn "Invalid option" && sleep 1 ;;
         esac
@@ -1532,6 +1602,7 @@ System
   optimize                       Enable BBR, forwarding and TCP tuning
   backup                         Save configuration to ${BACKUP_DIR}
   restore <file>                 Restore configuration from a backup
+  update                         Install the latest version from GitHub
   uninstall [--purge]            Remove everything (--purge also deletes config)
   up|down|apply <name>           Low-level actions used by systemd
   version | help
@@ -1722,6 +1793,7 @@ main() {
         backup) backup_create ;;
         restore) need_arg "backup file" "${1:-}" && backup_restore "$1" ;;
         import-legacy) legacy_import ;;
+        update) cmd_update ;;
         uninstall)
             if [[ ${1:-} == --purge ]]; then uninstall_all yes; else uninstall_all no; fi
             ;;
