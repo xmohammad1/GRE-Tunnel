@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly APP="gre-manager"
 readonly INSTALL_PATH="/usr/local/bin/${APP}"
 readonly CONF_DIR="/etc/${APP}"
@@ -30,6 +30,8 @@ readonly MONITOR_SERVICE="${SYSTEMD_DIR}/${APP}-monitor.service"
 readonly MONITOR_TIMER="${SYSTEMD_DIR}/${APP}-monitor.timer"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xmohammad1/GRE-Tunnel/main/gre-manager.sh"
+readonly ABUSE_CHAIN="GREM-ABUSE"
+readonly GUARD_METRIC=4242
 
 # Artifacts of the old single-tunnel script (gre2manager.sh).
 readonly LEGACY_SERVICE="gre-tun2"
@@ -39,7 +41,7 @@ readonly LEGACY_SCRIPT="/usr/local/bin/${LEGACY_SERVICE}.sh"
 # Keys allowed in a tunnel config file; anything else is ignored on load.
 readonly TUNNEL_KEYS=(NAME ROLE ID LOCAL_IP REMOTE_IP LOCAL_TUN_IP REMOTE_TUN_IP
     PREFIX IPV6 LOCAL_TUN_IP6 REMOTE_TUN_IP6 MTU TTL GRE_KEY FORWARDS
-    MSS_CLAMP NAT_OUT MONITOR COMMENT CREATED)
+    MSS_CLAMP NAT_OUT FW_ALLOW MONITOR COMMENT CREATED)
 
 # ---- Defaults, overridable in /etc/gre-manager/gre-manager.conf -------------
 SUBNET_BASE="10.100"        # tunnel ID N  ->  ${SUBNET_BASE}.N.0/30
@@ -49,6 +51,8 @@ DEFAULT_TTL=255
 MONITOR_INTERVAL="1min"
 MONITOR_FAILS=3
 MONITOR_PING_COUNT=3
+ABUSE_GUARD="no"            # drop private/reserved ranges leaving the public interface
+ABUSE_RANGES="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 198.18.0.0/15 192.0.0.0/24 192.0.2.0/24 198.51.100.0/24 203.0.113.0/24 240.0.0.0/4"
 
 # The tunnel currently loaded by tunnel_load().
 declare -A T=()
@@ -173,6 +177,19 @@ is_private_ipv4() {
     [[ $1 =~ ^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]
 }
 
+ipv4_to_int() {
+    local a b c d
+    IFS=. read -r a b c d <<<"$1"
+    echo $(((10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d))
+}
+
+# ipv4_network IP PREFIX  ->  network/prefix, e.g. 10.100.1.1 30 -> 10.100.1.0/30
+ipv4_network() {
+    local n
+    n=$(($(ipv4_to_int "$1") & ((0xFFFFFFFF << (32 - $2)) & 0xFFFFFFFF)))
+    printf '%d.%d.%d.%d/%d' $((n >> 24 & 255)) $((n >> 16 & 255)) $((n >> 8 & 255)) $((n & 255)) "$2"
+}
+
 is_port()      { is_uint "$1" && [[ $((10#$1)) -ge 1 && $((10#$1)) -le 65535 ]]; }
 is_mtu()       { is_uint "$1" && [[ $((10#$1)) -ge 576 && $((10#$1)) -le 9000 ]]; }
 is_tunnel_id() { is_uint "$1" && [[ $((10#$1)) -ge 1 && $((10#$1)) -le 254 ]]; }
@@ -194,7 +211,8 @@ load_global_conf() {
         [[ $line =~ ^[[:space:]]*([A-Z0-9_]+)=(.*)$ ]] || continue
         key=${BASH_REMATCH[1]}
         case $key in
-            SUBNET_BASE | SUBNET6_BASE | DEFAULT_MTU | DEFAULT_TTL | MONITOR_INTERVAL | MONITOR_FAILS | MONITOR_PING_COUNT)
+            SUBNET_BASE | SUBNET6_BASE | DEFAULT_MTU | DEFAULT_TTL | MONITOR_INTERVAL | MONITOR_FAILS | \
+                MONITOR_PING_COUNT | ABUSE_GUARD | ABUSE_RANGES)
                 printf -v "$key" '%s' "$(strip_quotes "$(trim "${BASH_REMATCH[2]}")")"
                 ;;
         esac
@@ -217,8 +235,23 @@ DEFAULT_TTL="${DEFAULT_TTL}"
 MONITOR_INTERVAL="${MONITOR_INTERVAL}"
 MONITOR_FAILS="${MONITOR_FAILS}"
 MONITOR_PING_COUNT="${MONITOR_PING_COUNT}"
+
+# Abuse guard: drop packets to these ranges when they leave the public interface.
+ABUSE_GUARD="${ABUSE_GUARD}"
+ABUSE_RANGES="${ABUSE_RANGES}"
 EOF
     chmod 600 "$GLOBAL_CONF"
+}
+
+set_global_conf() {
+    local key=$1 value=$2
+    write_default_global_conf
+    if grep -q "^${key}=" "$GLOBAL_CONF"; then
+        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$GLOBAL_CONF"
+    else
+        printf '%s="%s"\n' "$key" "$value" >>"$GLOBAL_CONF"
+    fi
+    printf -v "$key" '%s' "$value"
 }
 
 pkg_install() {
@@ -482,6 +515,7 @@ tunnel_defaults() {
     T[IPV6]=${T[IPV6]:-no}
     T[MSS_CLAMP]=${T[MSS_CLAMP]:-yes}
     T[NAT_OUT]=${T[NAT_OUT]:-no}
+    T[FW_ALLOW]=${T[FW_ALLOW]:-yes}
     T[MONITOR]=${T[MONITOR]:-yes}
 }
 
@@ -555,6 +589,15 @@ is_free_tunnel_id() {
     [[ -z $owner ]] && return 0
     warn "Tunnel ID $1 is already used by '${owner}'."
     return 1
+}
+
+# default_name BASE N  ->  first unused BASE<N>, BASE<N+1>, ...
+default_name() {
+    local n=$((10#$2))
+    while tunnel_exists "${1}${n}"; do
+        n=$((n + 1))
+    done
+    echo "${1}${n}"
 }
 
 is_new_tunnel_name() {
@@ -669,10 +712,13 @@ forward_del() {
 }
 
 # =============================================================================
-#  Firewall (iptables). Every tunnel owns chains GREM-<name>-{FWD,MSS,PRE,POST}
+#  Firewall (iptables). Every tunnel owns chains GREM-<name>-{IN,OUT,FWD,MSS,PRE,POST}
+#  whose jumps sit at the top of the built-in chains, so tunnel traffic is
+#  accepted before ufw or rules that block private ranges can drop it.
 # =============================================================================
 
-ipt() { iptables -w 5 "$@"; }
+# Runs ip6tables instead when the caller declares "local IPT=ip6tables".
+ipt() { "${IPT:-iptables}" -w 5 "$@"; }
 fw_chain() { printf 'GREM-%s-%s' "$1" "$2"; }
 
 fw_attach() {
@@ -688,17 +734,98 @@ fw_detach() {
     ipt -t "$table" -X "$chain" 2>/dev/null || true
 }
 
+# Deletes every jump from PARENT to CHAIN, whatever its matches, then CHAIN.
+fw_detach_all() {
+    local table=$1 parent=$2 chain=$3 rules rule
+    local -a args
+    rules=$(ipt -t "$table" -S "$parent" 2>/dev/null | grep -E -- "-j ${chain}( |$)" || true)
+    while IFS= read -r rule; do
+        [[ -n $rule ]] || continue
+        read -r -a args <<<"${rule/#-A /-D }"
+        ipt -t "$table" "${args[@]}" 2>/dev/null || true
+    done <<<"$rules"
+    ipt -t "$table" -F "$chain" 2>/dev/null || true
+    ipt -t "$table" -X "$chain" 2>/dev/null || true
+}
+
+# True when PARENT jumps to CHAIN before any rule that may drop the packet.
+fw_jump_first() {
+    local rules
+    rules=$(ipt -t "$1" -S "$2" 2>/dev/null) || return 1
+    awk -v jump=" -j $3" '
+        substr($0, length($0) - length(jump) + 1) == jump { found = 1; exit }
+        / -j (DROP|REJECT|ufw-)/ { exit }
+        END { exit !found }' <<<"$rules"
+}
+
 fw_clear() {
     local name=$1
+    if has_cmd iptables; then
+        fw_detach filter INPUT "$(fw_chain "$name" IN)"
+        fw_detach filter OUTPUT "$(fw_chain "$name" OUT)"
+        fw_detach filter FORWARD "$(fw_chain "$name" FWD)"
+        fw_detach mangle FORWARD "$(fw_chain "$name" MSS)"
+        fw_detach nat PREROUTING "$(fw_chain "$name" PRE)"
+        fw_detach nat POSTROUTING "$(fw_chain "$name" POST)"
+    fi
+    if has_cmd ip6tables; then
+        local IPT=ip6tables
+        fw_detach filter INPUT "$(fw_chain "$name" IN)"
+        fw_detach filter OUTPUT "$(fw_chain "$name" OUT)"
+        fw_detach filter FORWARD "$(fw_chain "$name" FWD)"
+    fi
+}
+
+# Accepts routed tunnel traffic even when the FORWARD policy is DROP (ufw, docker).
+fw_allow_forward() {
+    local fwd
+    fwd=$(fw_chain "$1" FWD)
+    fw_attach filter FORWARD "$fwd"
+    ipt -A "$fwd" -i "$2" -j ACCEPT
+    ipt -A "$fwd" -o "$2" -j ACCEPT
+}
+
+# Accepts GRE from/to the peer and all traffic on the tunnel interface, ahead
+# of ufw's default deny and of rules that block private ranges (anti-abuse).
+fw_allow_io() {
+    local in out
+    in=$(fw_chain "$1" IN)
+    out=$(fw_chain "$1" OUT)
+    fw_attach filter INPUT "$in"
+    fw_attach filter OUTPUT "$out"
+    if [[ ${IPT:-iptables} == iptables ]]; then
+        ipt -A "$in" -p 47 -s "${T[REMOTE_IP]}" -j ACCEPT
+        ipt -A "$out" -p 47 -d "${T[REMOTE_IP]}" -j ACCEPT
+    fi
+    ipt -A "$in" -i "$2" -j ACCEPT
+    ipt -A "$out" -o "$2" -j ACCEPT
+}
+
+fw_apply6() {
+    local IPT=ip6tables
+    fw_allow_forward "$1" "$2" || return 1
+    if [[ ${T[FW_ALLOW]} == yes ]]; then
+        fw_allow_io "$1" "$2" || return 1
+    fi
+}
+
+# False when a firewall reload (ufw, iptables-restore, ...) removed the rules
+# of the loaded tunnel or put blocking rules in front of them.
+fw_intact() {
+    local name=${T[NAME]}
     has_cmd iptables || return 0
-    fw_detach filter FORWARD "$(fw_chain "$name" FWD)"
-    fw_detach mangle FORWARD "$(fw_chain "$name" MSS)"
-    fw_detach nat PREROUTING "$(fw_chain "$name" PRE)"
-    fw_detach nat POSTROUTING "$(fw_chain "$name" POST)"
+    fw_jump_first filter FORWARD "$(fw_chain "$name" FWD)" || return 1
+    if [[ ${T[FW_ALLOW]} == yes ]]; then
+        fw_jump_first filter INPUT "$(fw_chain "$name" IN)" || return 1
+        fw_jump_first filter OUTPUT "$(fw_chain "$name" OUT)" || return 1
+    fi
+    if [[ -n ${T[FORWARDS]} ]]; then
+        ipt -t nat -C PREROUTING -j "$(fw_chain "$name" PRE)" 2>/dev/null || return 1
+    fi
 }
 
 fw_apply() {
-    local name=${T[NAME]} dev fwd mss pre post rule proto dport to
+    local name=${T[NAME]} dev mss pre post rule proto dport to
     local -a protos
     dev=$(dev_name "$name")
     fw_clear "$name"
@@ -707,11 +834,13 @@ fw_apply() {
         return 0
     fi
 
-    # Accept tunnel traffic even when the FORWARD policy is DROP (ufw, docker).
-    fwd=$(fw_chain "$name" FWD)
-    fw_attach filter FORWARD "$fwd"
-    ipt -A "$fwd" -i "$dev" -j ACCEPT
-    ipt -A "$fwd" -o "$dev" -j ACCEPT
+    fw_allow_forward "$name" "$dev"
+    if [[ ${T[FW_ALLOW]} == yes ]]; then
+        fw_allow_io "$name" "$dev"
+    fi
+    if [[ ${T[IPV6]} == yes ]] && has_cmd ip6tables; then
+        fw_apply6 "$name" "$dev" 2>/dev/null || warn "Could not add ip6tables rules for ${dev}."
+    fi
 
     if [[ ${T[MSS_CLAMP]} == yes ]]; then
         mss=$(fw_chain "$name" MSS)
@@ -750,6 +879,138 @@ fw_apply() {
 }
 
 # =============================================================================
+#  Abuse protection
+#
+#  Providers such as Hetzner report servers whose public interface sends packets
+#  to private or reserved addresses ("netscan" abuse).
+#  * Leak guard (always on): a high-metric blackhole route per tunnel network,
+#    so traffic for the peer's inner IP is dropped locally while the tunnel is
+#    down instead of leaving through the default route.
+#  * Abuse guard (optional): drops packets to private/reserved ranges that leave
+#    the public interface. Tunnel traffic uses gre-* interfaces and is unaffected.
+# =============================================================================
+
+# leak_guard add|del — for the loaded tunnel.
+leak_guard() {
+    local op=replace net
+    [[ $1 == del ]] && op=del
+    net=$(ipv4_network "${T[LOCAL_TUN_IP]}" "${T[PREFIX]}")
+    if ! ip route "$op" blackhole "$net" metric "$GUARD_METRIC" 2>/dev/null && [[ $op != del ]]; then
+        warn "Could not add the leak-guard route for ${net}."
+    fi
+    if [[ ${T[IPV6]} == yes ]]; then
+        ip -6 route "$op" blackhole "${T[LOCAL_TUN_IP6]%::*}::/64" metric "$GUARD_METRIC" 2>/dev/null || true
+    fi
+}
+
+# Prints "<interface> <gateway>" of the IPv4 default route.
+wan_info() {
+    ip -4 route show default 2>/dev/null | awk '{
+        for (i = 1; i < NF; i++) { if ($i == "dev") d = $(i + 1); if ($i == "via") g = $(i + 1) }
+        print d, g; exit
+    }'
+}
+
+# IPv4 resolvers in use; they must stay reachable even when private.
+dns_servers() {
+    local f
+    for f in /etc/resolv.conf /run/systemd/resolve/resolv.conf; do
+        [[ -r $f ]] || continue
+        awk '$1 == "nameserver" && $2 ~ /^[0-9]+(\.[0-9]+){3}$/ { print $2 }' "$f"
+    done | sort -u
+}
+
+abuse_guard_clear() {
+    has_cmd iptables || return 0
+    fw_detach_all mangle POSTROUTING "$ABUSE_CHAIN"
+}
+
+abuse_guard_apply() {
+    local wan gw addr ip range
+    local -a addrs dns ranges
+    abuse_guard_clear
+    [[ $ABUSE_GUARD == yes ]] || return 0
+    if ! has_cmd iptables; then
+        warn "iptables not found; abuse guard skipped."
+        return 0
+    fi
+    read -r wan gw <<<"$(wan_info)"
+    if [[ -z $wan ]]; then
+        warn "No IPv4 default route; abuse guard skipped."
+        return 0
+    fi
+    mapfile -t addrs < <(ip -4 -o addr show dev "$wan" 2>/dev/null | awk '{ print $4 }')
+    mapfile -t dns < <(dns_servers)
+    read -r -a ranges <<<"$ABUSE_RANGES"
+
+    # mangle/POSTROUTING sees both local and forwarded traffic after routing, so
+    # ACCEPT rules in the filter table cannot bypass the guard.
+    ipt -t mangle -N "$ABUSE_CHAIN" 2>/dev/null || ipt -t mangle -F "$ABUSE_CHAIN"
+    # Never block the interface's own networks, the gateway or the resolvers.
+    for addr in "${addrs[@]}"; do
+        ipt -t mangle -A "$ABUSE_CHAIN" -d "$(ipv4_network "${addr%/*}" "${addr#*/}")" -j RETURN
+    done
+    if [[ -n $gw ]]; then
+        ipt -t mangle -A "$ABUSE_CHAIN" -d "$gw" -j RETURN
+    fi
+    for ip in "${dns[@]}"; do
+        ipt -t mangle -A "$ABUSE_CHAIN" -d "$ip" -j RETURN
+    done
+    for range in "${ranges[@]}"; do
+        ipt -t mangle -A "$ABUSE_CHAIN" -d "$range" -j DROP
+    done
+    ipt -t mangle -I POSTROUTING -o "$wan" -j "$ABUSE_CHAIN"
+}
+
+abuse_guard_intact() {
+    local wan
+    read -r wan _ <<<"$(wan_info)"
+    [[ -z $wan ]] || ipt -t mangle -C POSTROUTING -o "$wan" -j "$ABUSE_CHAIN" 2>/dev/null
+}
+
+abuse_guard_drops() {
+    ipt -t mangle -L "$ABUSE_CHAIN" -v -n -x 2>/dev/null | awk '$3 == "DROP" { s += $1 } END { print s + 0 }'
+}
+
+# abuse_guard_set yes|no [force]
+abuse_guard_set() {
+    local wan addr
+    if [[ $1 == yes && ${2:-} != force ]]; then
+        read -r wan _ <<<"$(wan_info)"
+        addr=$(ip -4 -o addr show dev "${wan:-lo}" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }')
+        if is_private_ipv4 "${addr:-}"; then
+            err "Public interface ${wan} has the private address ${addr} (cloud NAT such as AWS, GCP or Oracle)."
+            err "The abuse guard could cut this server off from its provider's network; use '${APP} abuse-guard on --force' to enable it anyway."
+            return 1
+        fi
+    fi
+    set_global_conf ABUSE_GUARD "$1"
+    abuse_guard_apply
+    if [[ $1 == yes ]]; then
+        ok "Abuse guard enabled."
+    else
+        ok "Abuse guard disabled."
+    fi
+}
+
+abuse_guard_status() {
+    local wan gw state=$ABUSE_GUARD
+    local -a ranges
+    read -r wan gw <<<"$(wan_info)"
+    if [[ $state == yes ]] && ! abuse_guard_intact; then
+        state="yes (rules missing; the health monitor re-applies them)"
+    fi
+    kv "Abuse guard" "$state"
+    kv "Public interface" "${wan:-none} (gateway ${gw:-none})"
+    if [[ $ABUSE_GUARD == yes ]]; then
+        kv "Dropped packets" "$(abuse_guard_drops)"
+    fi
+    kv "Blocked ranges" "(ABUSE_RANGES in ${GLOBAL_CONF})"
+    read -r -a ranges <<<"$ABUSE_RANGES"
+    printf '      %-17s %-17s %-17s\n' "${ranges[@]}"
+}
+
+# =============================================================================
 #  Tunnel lifecycle (called by systemd through "up", "down" and "apply")
 # =============================================================================
 
@@ -777,11 +1038,15 @@ tunnel_up() {
             warn "Could not add IPv6 address to ${dev} (is IPv6 disabled on this host?)"
     fi
     ip link set "$dev" up
+    leak_guard add
 
     if [[ -n ${T[FORWARDS]} || ${T[NAT_OUT]} == yes ]]; then
         ensure_forwarding
     fi
     fw_apply
+    if [[ $ABUSE_GUARD == yes ]] && ! abuse_guard_intact; then
+        abuse_guard_apply
+    fi
     rm -f "${STATE_DIR}/${name}.fails"
     ok "Tunnel ${name} up: ${dev} ${T[LOCAL_TUN_IP]} -> ${T[REMOTE_TUN_IP]} via ${T[REMOTE_IP]}"
 }
@@ -823,9 +1088,13 @@ svc_restart() {
     fi
 }
 
+# Stops a tunnel for good: unlike "down", this also drops its leak guard.
 svc_remove() {
     systemctl disable --now "$(unit_name "$1")" >/dev/null 2>&1 || true
     tunnel_down "$1" >/dev/null
+    if tunnel_exists "$1"; then
+        (tunnel_load "$1" && leak_guard del) || true
+    fi
 }
 
 # Prints up | down | missing.
@@ -962,6 +1231,14 @@ cmd_status() {
     kv "MSS clamp" "${T[MSS_CLAMP]}"
     kv "NAT-out (gateway)" "${T[NAT_OUT]}"
     kv "Health monitor" "${T[MONITOR]}"
+    kv "Firewall allow" "${T[FW_ALLOW]}"
+    if [[ $(tunnel_state "$name") == up ]]; then
+        if fw_intact; then
+            kv "Firewall rules" "in place"
+        else
+            kv "Firewall rules" "missing or outranked (the health monitor re-applies them)"
+        fi
+    fi
     kv "Service" "$(systemctl is-active "$unit" 2>/dev/null || true) / $(systemctl is-enabled "$unit" 2>/dev/null || true)"
     if [[ -r ${stats_dir}/rx_bytes ]]; then
         kv "Traffic" "RX $(human_bytes "$(<"${stats_dir}/rx_bytes")")  TX $(human_bytes "$(<"${stats_dir}/tx_bytes")")"
@@ -1037,8 +1314,14 @@ cmd_monitor() {
     mkdir -p "$STATE_DIR"
     for name in $(tunnel_names); do
         tunnel_load "$name"
-        [[ ${T[MONITOR]} == yes ]] || continue
         systemctl is-enabled --quiet "$(unit_name "$name")" 2>/dev/null || continue
+        leak_guard add
+        # "ufw reload", iptables-restore or anti-abuse scripts may wipe or outrank our rules.
+        if [[ $(tunnel_state "$name") == up ]] && ! fw_intact; then
+            log WARN "monitor: firewall rules of ${name} were removed or outranked; re-applying"
+            fw_apply || log ERROR "monitor: re-applying firewall rules of ${name} failed"
+        fi
+        [[ ${T[MONITOR]} == yes ]] || continue
         fail_file="${STATE_DIR}/${name}.fails"
         if ping -c "$MONITOR_PING_COUNT" -W 2 -q "${T[REMOTE_TUN_IP]}" &>/dev/null; then
             rm -f "$fail_file"
@@ -1053,6 +1336,10 @@ cmd_monitor() {
             rm -f "$fail_file"
         fi
     done
+    if [[ $ABUSE_GUARD == yes ]] && ! abuse_guard_intact; then
+        log WARN "monitor: abuse guard rules were missing; re-applying"
+        abuse_guard_apply >/dev/null 2>&1 || log ERROR "monitor: re-applying the abuse guard failed"
+    fi
 }
 
 monitor_enabled() { systemctl is-enabled --quiet "${APP}-monitor.timer" 2>/dev/null; }
@@ -1163,6 +1450,7 @@ uninstall_all() {
         svc_remove "$name"
     done
     systemctl disable --now "${APP}-monitor.timer" >/dev/null 2>&1 || true
+    abuse_guard_clear
     rm -f "$UNIT_TEMPLATE" "$MONITOR_SERVICE" "$MONITOR_TIMER" "$SYSCTL_FILE" "$INSTALL_PATH"
     systemctl daemon-reload
     if [[ $purge == yes ]]; then
@@ -1234,8 +1522,9 @@ print_banner() {
     printf '  ║      Iran  ⇄  Kharej  ·  one-to-many         ║\n'
     printf '  ╚══════════════════════════════════════════════╝\n'
     printf '%s' "$C_RESET"
-    printf '  Host: %s%s%s   Tunnels: %s%d up%s / %d   Monitor: %s\n\n' \
-        "$C_BOLD" "$(hostname 2>/dev/null || echo '?')" "$C_RESET" "$C_GREEN" "$up" "$C_RESET" "$total" "$monitor"
+    printf '  Host: %s%s%s   Tunnels: %s%d up%s / %d   Monitor: %s   Abuse guard: %s\n\n' \
+        "$C_BOLD" "$(hostname 2>/dev/null || echo '?')" "$C_RESET" "$C_GREEN" "$up" "$C_RESET" "$total" \
+        "$monitor" "$ABUSE_GUARD"
 }
 
 ui_add() {
@@ -1253,7 +1542,7 @@ ui_add() {
     info "The tunnel ID selects subnet ${SUBNET_BASE}.<ID>.0/30 and must be the SAME on both servers."
     ask id "Tunnel ID (1-254)" "$(next_free_id || true)" is_free_tunnel_id
     id=$((10#$id))
-    ask name "Tunnel name (usually the peer's name)" "${peer_role}${id}" is_new_tunnel_name
+    ask name "Tunnel name (usually the peer's name)" "$(default_name "$peer_role" "$id")" is_new_tunnel_name
 
     info "Detecting this server's public IPv4 ..."
     def_ip=$(detect_public_ip || true)
@@ -1315,7 +1604,8 @@ ui_edit() {
         printf '   7) MSS clamping ......... %s\n' "${T[MSS_CLAMP]}"
         printf '   8) NAT-out (gateway) .... %s\n' "${T[NAT_OUT]}"
         printf '   9) Health monitor ....... %s\n' "${T[MONITOR]}"
-        printf '  10) Comment .............. %s\n' "${T[COMMENT]:--}"
+        printf '  10) Firewall allow rules . %s\n' "${T[FW_ALLOW]}"
+        printf '  11) Comment .............. %s\n' "${T[COMMENT]:--}"
         printf '\n   s) Save & apply    0) Cancel\n'
         read -r -p "  Select: " choice || return 0
         case $choice in
@@ -1337,13 +1627,16 @@ ui_edit() {
             7) toggle MSS_CLAMP ;;
             8) toggle NAT_OUT ;;
             9) toggle MONITOR ;;
-            10)
+            10) toggle FW_ALLOW ;;
+            11)
                 ask value "Comment" "${T[COMMENT]}" ""
                 T[COMMENT]=${value//[\"\\]/}
                 ;;
             s | S)
                 other=$(tunnel_with_endpoints "${T[LOCAL_IP]}" "${T[REMOTE_IP]}" "${T[GRE_KEY]}")
                 [[ -z $other ]] || die "Tunnel '${other}' already uses the same endpoints and GRE key."
+                # Drop the leak guard of the saved config; the new one is added on start.
+                (tunnel_load "$name" && leak_guard del) || true
                 tunnel_save
                 svc_restart "$name"
                 ok "Tunnel '${name}' updated."
@@ -1493,6 +1786,21 @@ ui_backup() {
     esac
 }
 
+ui_abuse_guard() {
+    local choice
+    section "Abuse guard"
+    printf '  Drops packets to private/reserved ranges that would leave the public\n'
+    printf '  interface; providers such as Hetzner report them as "netscan" abuse.\n'
+    printf '  Tunnel traffic is not affected.\n\n'
+    abuse_guard_status
+    printf '\n   1) Enable   2) Disable   0) Back\n'
+    read -r -p "  Select: " choice || return 0
+    case $choice in
+        1) abuse_guard_set yes || { confirm "Enable it anyway?" n && abuse_guard_set yes force; } ;;
+        2) abuse_guard_set no ;;
+    esac
+}
+
 ui_logs() {
     section "Log: ${LOG_FILE}"
     tail -n 30 "$LOG_FILE" 2>/dev/null || info "Log is empty."
@@ -1538,6 +1846,7 @@ main_menu() {
     local choice
     check_legacy
     while true; do
+        load_global_conf
         print_banner
         printf '  %sTunnels%s\n' "$C_BOLD" "$C_RESET"
         printf '    1) Add tunnel             4) Edit tunnel\n'
@@ -1546,9 +1855,10 @@ main_menu() {
         printf '\n  %sTraffic%s\n' "$C_BOLD" "$C_RESET"
         printf '    7) Port forwarding        8) Connectivity & MTU test\n'
         printf '\n  %sSystem%s\n' "$C_BOLD" "$C_RESET"
-        printf '    9) Health monitor        12) Logs\n'
-        printf '   10) Kernel optimization   13) Update %s\n' "$APP"
-        printf '   11) Backup / Restore      14) Uninstall\n'
+        printf '    9) Health monitor        13) Logs\n'
+        printf '   10) Abuse guard           14) Update %s\n' "$APP"
+        printf '   11) Kernel optimization   15) Uninstall\n'
+        printf '   12) Backup / Restore\n'
         printf '\n    0) Exit\n\n'
         read -r -p "  Select: " choice || exit 0
         case $choice in
@@ -1561,11 +1871,12 @@ main_menu() {
             7) run_action ui_forwards ;;
             8) run_action ui_test ;;
             9) run_action ui_monitor ;;
-            10) run_action ui_optimize ;;
-            11) run_action ui_backup ;;
-            12) run_action ui_logs ;;
-            13) ui_update ;;
-            14) ui_uninstall ;;
+            10) run_action ui_abuse_guard ;;
+            11) run_action ui_optimize ;;
+            12) run_action ui_backup ;;
+            13) run_action ui_logs ;;
+            14) ui_update ;;
+            15) ui_uninstall ;;
             0 | q | Q) exit 0 ;;
             *) warn "Invalid option" && sleep 1 ;;
         esac
@@ -1599,6 +1910,7 @@ Traffic
 
 System
   monitor [--enable|--disable]   Run the health check once, or toggle its timer
+  abuse-guard [on|off] [--force] Drop private ranges leaving the public interface
   optimize                       Enable BBR, forwarding and TCP tuning
   backup                         Save configuration to ${BACKUP_DIR}
   restore <file>                 Restore configuration from a backup
@@ -1619,6 +1931,7 @@ Options for "add"
   --no-mss-clamp         Disable TCP MSS clamping
   --nat-out              Let the peer use this server as internet gateway
   --no-monitor           Exclude this tunnel from the health monitor
+  --no-fw-allow          Don't add INPUT/OUTPUT accept rules (let ufw/iptables filter the tunnel)
   --forward "SPECS"      Port forwards, e.g. "tcp:443 udp:51820"
   --local-tun IP --remote-tun IP   Custom inner addresses instead of ${SUBNET_BASE}.<id>.x/30
   --comment TEXT         Free-form note
@@ -1662,6 +1975,7 @@ cmd_add() {
             --no-mss-clamp) T[MSS_CLAMP]=no ;;
             --nat-out) T[NAT_OUT]=yes ;;
             --no-monitor) T[MONITOR]=no ;;
+            --no-fw-allow) T[FW_ALLOW]=no ;;
             *) die "Unknown option for add: $1" ;;
         esac
         shift
@@ -1676,7 +1990,7 @@ cmd_add() {
     peer_role=kharej
     [[ ${T[ROLE]} == kharej ]] && peer_role=iran
     if [[ -z ${T[NAME]:-} ]]; then
-        T[NAME]="${peer_role}$((10#${T[ID]}))"
+        T[NAME]=$(default_name "$peer_role" "${T[ID]}")
     fi
     if [[ -z ${T[LOCAL_IP]:-} ]]; then
         T[LOCAL_IP]=$(detect_public_ip) || die "Could not detect the public IP; pass --local."
@@ -1778,8 +2092,8 @@ main() {
                 for name in $(tunnel_names); do cmd_status "$name"; done
             fi
             ;;
-        restart) cmd_for_each restart_tunnel "${1:-}" ;;
-        remove | rm | delete) cmd_for_each remove_tunnel "${1:-}" ;;
+        restart) cmd_for_each restart_tunnel "${1:-}" || exit 1 ;;
+        remove | rm | delete) cmd_for_each remove_tunnel "${1:-}" || exit 1 ;;
         test) need_tunnel "${1:-}" && cmd_test "$1" ;;
         forward | fw) cmd_forward "$@" ;;
         monitor)
@@ -1789,11 +2103,19 @@ main() {
                 *) die "Usage: ${APP} monitor [--enable|--disable]" ;;
             esac
             ;;
+        abuse-guard)
+            case ${1:-status} in
+                on | --enable) abuse_guard_set yes "$([[ ${2:-} == --force ]] && echo force)" || exit 1 ;;
+                off | --disable) abuse_guard_set no ;;
+                status) abuse_guard_status ;;
+                *) die "Usage: ${APP} abuse-guard [on|off|status] [--force]" ;;
+            esac
+            ;;
         optimize) cmd_optimize ;;
         backup) backup_create ;;
         restore) need_arg "backup file" "${1:-}" && backup_restore "$1" ;;
         import-legacy) legacy_import ;;
-        update) cmd_update ;;
+        update) cmd_update || exit 1 ;;
         uninstall)
             if [[ ${1:-} == --purge ]]; then uninstall_all yes; else uninstall_all no; fi
             ;;
