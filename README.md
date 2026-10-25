@@ -20,7 +20,7 @@
 ## نصب
 
 ```bash
-sudo bash gre-manager.sh
+bash <(curl -s https://raw.githubusercontent.com/xmohammad1/GRE-Tunnel/refs/heads/main/gre-manager.sh)
 ```
 
 اولین اجرا اسکریپت را در `/usr/local/bin/gre-manager` نصب می‌کند؛ از آن به بعد کافی است `sudo gre-manager` بزنید.
