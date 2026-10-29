@@ -5,6 +5,7 @@
 #  * Several tunnels per server (one Iran server -> many Kharej servers)
 #  * Persistent tunnels through a systemd template unit (gre-manager@<name>)
 #  * Port forwarding (DNAT) through the tunnel, MSS clamping, optional NAT-out
+#  * Tunnel tuning: larger initial TCP window on tunnel routes, RPS for GRE
 #  * Health monitor that restarts dead tunnels, connectivity and MTU tests
 #  * Backup / restore, kernel tuning (BBR), interactive menu and a full CLI
 #
@@ -14,7 +15,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="2.2.0"
+readonly VERSION="2.3.0"
 readonly APP="gre-manager"
 readonly INSTALL_PATH="/usr/local/bin/${APP}"
 readonly CONF_DIR="/etc/${APP}"
@@ -28,7 +29,10 @@ readonly SYSTEMD_DIR="/etc/systemd/system"
 readonly UNIT_TEMPLATE="${SYSTEMD_DIR}/${APP}@.service"
 readonly MONITOR_SERVICE="${SYSTEMD_DIR}/${APP}-monitor.service"
 readonly MONITOR_TIMER="${SYSTEMD_DIR}/${APP}-monitor.timer"
-readonly SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
+# "zz" makes it load after 99-sysctl.conf (/etc/sysctl.conf) and other 99-* files,
+# which would otherwise replace these values at boot.
+readonly SYSCTL_FILE="/etc/sysctl.d/99-zz-${APP}.conf"
+readonly OLD_SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"   # name before 2.3.0
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xmohammad1/GRE-Tunnel/main/gre-manager.sh"
 readonly ABUSE_CHAIN="GREM-ABUSE"
 readonly GUARD_METRIC=4242
@@ -53,6 +57,8 @@ MONITOR_FAILS=3
 MONITOR_PING_COUNT=3
 ABUSE_GUARD="no"            # drop private/reserved ranges leaving the public interface
 ABUSE_RANGES="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 198.18.0.0/15 192.0.0.0/24 192.0.2.0/24 198.51.100.0/24 203.0.113.0/24 240.0.0.0/4"
+ROUTE_OPTS="initcwnd 64 initrwnd 64"   # options of each tunnel's route ("" = kernel defaults)
+GRE_RPS="auto"              # RPS on gre-* devices: auto (when the public NIC has none) | yes | no
 
 # The tunnel currently loaded by tunnel_load().
 declare -A T=()
@@ -212,7 +218,7 @@ load_global_conf() {
         key=${BASH_REMATCH[1]}
         case $key in
             SUBNET_BASE | SUBNET6_BASE | DEFAULT_MTU | DEFAULT_TTL | MONITOR_INTERVAL | MONITOR_FAILS | \
-                MONITOR_PING_COUNT | ABUSE_GUARD | ABUSE_RANGES)
+                MONITOR_PING_COUNT | ABUSE_GUARD | ABUSE_RANGES | ROUTE_OPTS | GRE_RPS)
                 printf -v "$key" '%s' "$(strip_quotes "$(trim "${BASH_REMATCH[2]}")")"
                 ;;
         esac
@@ -230,6 +236,12 @@ SUBNET_BASE="${SUBNET_BASE}"
 SUBNET6_BASE="${SUBNET6_BASE}"
 DEFAULT_MTU="${DEFAULT_MTU}"
 DEFAULT_TTL="${DEFAULT_TTL}"
+
+# Options of each tunnel's route (empty = kernel defaults). A larger initial TCP
+# window saves round trips on every new connection; set the same on BOTH servers.
+ROUTE_OPTS="${ROUTE_OPTS}"
+# RPS on gre-* devices: auto (only when the public NIC has no RPS of its own), yes, no.
+GRE_RPS="${GRE_RPS}"
 
 # Health monitor: restart a tunnel after MONITOR_FAILS failed checks in a row.
 MONITOR_INTERVAL="${MONITOR_INTERVAL}"
@@ -430,6 +442,7 @@ bootstrap() {
     ensure_deps
     install_self
     write_default_global_conf
+    sysctl_file_migrate
     if [[ ! -f $UNIT_TEMPLATE || $SELF_UPDATED -eq 1 ]]; then
         write_units
         systemctl enable --now "${APP}-monitor.timer" >/dev/null 2>&1 || warn "Could not enable the health monitor timer."
@@ -441,7 +454,15 @@ acquire_lock() {
     flock -n 9 || die "Another ${APP} instance is running."
 }
 
+# Before 2.3.0 the file was 99-gre-manager.conf, which loads before 99-sysctl.conf.
+sysctl_file_migrate() {
+    if [[ -f $OLD_SYSCTL_FILE && ! -e $SYSCTL_FILE ]]; then
+        mv -f "$OLD_SYSCTL_FILE" "$SYSCTL_FILE"
+    fi
+}
+
 ensure_forwarding() {
+    sysctl_file_migrate
     if [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) != 1 ]]; then
         sysctl -qw net.ipv4.ip_forward=1
     fi
@@ -510,7 +531,7 @@ tunnel_defaults() {
         T[$key]=${T[$key]:-}
     done
     T[PREFIX]=${T[PREFIX]:-30}
-    T[MTU]=${T[MTU]:-$DEFAULT_MTU}
+    T[MTU]=${T[MTU]:-$(default_mtu "${T[GRE_KEY]}")}
     T[TTL]=${T[TTL]:-$DEFAULT_TTL}
     T[IPV6]=${T[IPV6]:-no}
     T[MSS_CLAMP]=${T[MSS_CLAMP]:-yes}
@@ -721,6 +742,20 @@ forward_del() {
 ipt() { "${IPT:-iptables}" -w 5 "$@"; }
 fw_chain() { printf 'GREM-%s-%s' "$1" "$2"; }
 
+# fw_locked NAME CMD... — runs a firewall change under lock NAME (one per tunnel, one
+# for the abuse guard). Without it the tunnel units, the monitor and the CLI can
+# interleave two flush-and-re-add runs and leave rules missing.
+fw_locked() {
+    local fd rc lock="${STATE_DIR}/$1.lock"
+    shift
+    exec {fd}>>"$lock"
+    flock -w 20 "$fd" || warn "${lock} is still held after 20 s; continuing anyway."
+    "$@"
+    rc=$?
+    exec {fd}>&-
+    return "$rc"
+}
+
 fw_attach() {
     local table=$1 parent=$2 chain=$3
     ipt -t "$table" -N "$chain" 2>/dev/null || ipt -t "$table" -F "$chain"
@@ -824,7 +859,9 @@ fw_intact() {
     fi
 }
 
-fw_apply() {
+fw_apply() { fw_locked "fw-${T[NAME]}" fw_apply_rules; }
+
+fw_apply_rules() {
     local name=${T[NAME]} dev mss pre post rule proto dport to
     local -a protos
     dev=$(dev_name "$name")
@@ -925,7 +962,9 @@ abuse_guard_clear() {
     fw_detach_all mangle POSTROUTING "$ABUSE_CHAIN"
 }
 
-abuse_guard_apply() {
+abuse_guard_apply() { fw_locked abuse-guard abuse_guard_rules; }
+
+abuse_guard_rules() {
     local wan gw addr ip range
     local -a addrs dns ranges
     abuse_guard_clear
@@ -1011,6 +1050,106 @@ abuse_guard_status() {
 }
 
 # =============================================================================
+#  Tunnel tuning
+#
+#  * Route options (ROUTE_OPTS): every connection relayed through the tunnel is a
+#    fresh TCP connection, and with the kernel's default initial window a 100 KB
+#    object needs 2-3 extra round trips on a 70-170 ms Iran <-> Kharej path.
+#    "initcwnd 64 initrwnd 64" on both ends made 100 KB / 400 KB / 1.5 MB
+#    transfers 24% / 16% / 20% faster in tests. The kernel recreates the route
+#    without them when the address is re-added or the link comes back up, so
+#    "up" and "apply" set them and the health monitor restores them.
+#  * RPS (GRE_RPS): NICs hash GRE packets only on the outer addresses (GRE has no
+#    ports), so a single CPU receives all of a tunnel's traffic. RPS on the gre-*
+#    device spreads the inner flows over all CPUs (busiest CPU 51% -> 30% in tests).
+# =============================================================================
+
+# Hex mask of CPUs 0..N-1 in the comma-separated format of rps_cpus.
+cpu_mask_all() {
+    local n full rem out="" i
+    n=$(nproc --all 2>/dev/null || echo 1)
+    full=$((n / 32)) rem=$((n % 32))
+    if ((rem > 0)); then
+        out=$(printf '%x' $(((1 << rem) - 1)))
+    fi
+    for ((i = 0; i < full; i++)); do
+        out+=${out:+,}ffffffff
+    done
+    printf '%s' "$out"
+}
+
+# Prints the interface that carries the loaded tunnel's GRE packets.
+underlay_dev() {
+    ip -4 route get "${T[REMOTE_IP]}" 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }' || true
+}
+
+# GRE adds 24 bytes (outer IPv4 + GRE header), 28 with a key.
+gre_overhead() { [[ -n ${1:-} ]] && echo 28 || echo 24; }
+
+# DEFAULT_MTU is meant for a keyless tunnel; a key takes 4 more header bytes.
+default_mtu() { [[ -n ${1:-} ]] && echo $((DEFAULT_MTU - 4)) || echo "$DEFAULT_MTU"; }
+
+# Warns when the loaded tunnel's packets cannot fit the underlay interface.
+mtu_check() {
+    local udev umtu overhead
+    udev=$(underlay_dev)
+    [[ -n $udev && -r /sys/class/net/${udev}/mtu ]] || return 0
+    umtu=$(<"/sys/class/net/${udev}/mtu")
+    overhead=$(gre_overhead "${T[GRE_KEY]}")
+    if ((${T[MTU]} + overhead > umtu)); then
+        warn "MTU ${T[MTU]} + ${overhead} bytes of GRE headers exceeds the ${umtu} MTU of ${udev}; packets will be fragmented or dropped. Use MTU $((umtu - overhead)) or lower."
+    fi
+}
+
+# Applies ROUTE_OPTS to the loaded tunnel's inner network route on DEV.
+route_tune_apply() {
+    local dev=$1 net
+    [[ -n $ROUTE_OPTS ]] || return 0
+    net=$(ipv4_network "${T[LOCAL_TUN_IP]}" "${T[PREFIX]}")
+    # "proto kernel" keeps the kernel removing the route together with the address.
+    # shellcheck disable=SC2086  # ROUTE_OPTS is a list of route options
+    if ! ip route replace "$net" dev "$dev" proto kernel scope link src "${T[LOCAL_TUN_IP]}" $ROUTE_OPTS 2>/dev/null; then
+        warn "Could not apply route options '${ROUTE_OPTS}' to ${net} on ${dev}."
+    fi
+    if [[ ${T[IPV6]} == yes ]]; then
+        # shellcheck disable=SC2086
+        ip -6 route replace "${T[LOCAL_TUN_IP6]%::*}::/64" dev "$dev" proto kernel metric 256 $ROUTE_OPTS 2>/dev/null || true
+    fi
+}
+
+# True when the tunnel route on DEV carries every "name value" pair of ROUTE_OPTS.
+route_tune_intact() {
+    local dev=$1 line i
+    local -a opts
+    read -r -a opts <<<"$ROUTE_OPTS"
+    ((${#opts[@]} > 0)) || return 0
+    line=" $(ip -4 route show dev "$dev" proto kernel scope link 2>/dev/null | head -n1) " || true
+    for ((i = 0; i + 1 < ${#opts[@]}; i += 2)); do
+        [[ $line == *" ${opts[i]} ${opts[i + 1]} "* ]] || return 1
+    done
+}
+
+# Spreads DEV's receive processing over all CPUs. In auto mode it is skipped when the
+# underlay NIC has RPS of its own (e.g. single-queue virtio with RPS set): that RPS
+# already hashes the inner flows, and a second steering hop would only add work.
+gre_rps_apply() {
+    local dev=$1 q file="/sys/class/net/$1/queues/rx-0/rps_cpus"
+    [[ ($GRE_RPS == yes || $GRE_RPS == auto) && -w $file ]] || return 0
+    if [[ $GRE_RPS == auto ]]; then
+        for q in /sys/class/net/"$(underlay_dev)"/queues/rx-*/rps_cpus; do
+            [[ -z $(tr -d '0,\n' <"$q") ]] || return 0
+        done
+    fi
+    { cpu_mask_all >"$file"; } 2>/dev/null || warn "Could not set RPS on ${dev}."
+}
+
+tunnel_tune() {
+    route_tune_apply "$1"
+    gre_rps_apply "$1"
+}
+
+# =============================================================================
 #  Tunnel lifecycle (called by systemd through "up", "down" and "apply")
 # =============================================================================
 
@@ -1032,12 +1171,14 @@ tunnel_up() {
     fi
     ip tunnel add "$dev" "${args[@]}"
     ip link set "$dev" mtu "${T[MTU]}"
+    mtu_check
     ip addr add "${T[LOCAL_TUN_IP]}/${T[PREFIX]}" dev "$dev"
     if [[ ${T[IPV6]} == yes ]]; then
         ip -6 addr add "${T[LOCAL_TUN_IP6]}/64" dev "$dev" nodad 2>/dev/null ||
             warn "Could not add IPv6 address to ${dev} (is IPv6 disabled on this host?)"
     fi
     ip link set "$dev" up
+    tunnel_tune "$dev"
     leak_guard add
 
     if [[ -n ${T[FORWARDS]} || ${T[NAT_OUT]} == yes ]]; then
@@ -1054,7 +1195,7 @@ tunnel_up() {
 tunnel_down() {
     local name=$1 dev
     dev=$(dev_name "$name")
-    fw_clear "$name"
+    fw_locked "fw-${name}" fw_clear "$name"
     if ip link show "$dev" &>/dev/null; then
         ip link set "$dev" down 2>/dev/null || true
         ip tunnel del "$dev" 2>/dev/null || ip link del "$dev" 2>/dev/null || true
@@ -1063,18 +1204,23 @@ tunnel_down() {
     ok "Tunnel ${name} down"
 }
 
-# Re-applies firewall rules without recreating the interface.
+# Re-applies MTU, tuning and firewall rules without recreating the interface, so
+# connections through the tunnel survive.
 tunnel_apply() {
+    local dev
     tunnel_load "$1"
     if [[ $(tunnel_state "$1") != up ]]; then
         info "Tunnel $1 is not up; rules will be applied when it starts."
         return 0
     fi
+    dev=$(dev_name "$1")
+    ip link set "$dev" mtu "${T[MTU]}"
+    tunnel_tune "$dev"
     if [[ -n ${T[FORWARDS]} || ${T[NAT_OUT]} == yes ]]; then
         ensure_forwarding
     fi
     fw_apply
-    ok "Firewall rules of tunnel $1 applied."
+    ok "Settings and firewall rules of tunnel $1 applied."
 }
 
 svc_restart() {
@@ -1238,6 +1384,14 @@ cmd_status() {
         else
             kv "Firewall rules" "missing or outranked (the health monitor re-applies them)"
         fi
+        if [[ -z $ROUTE_OPTS ]]; then
+            kv "Route options" "kernel defaults"
+        elif route_tune_intact "$dev"; then
+            kv "Route options" "$ROUTE_OPTS"
+        else
+            kv "Route options" "${ROUTE_OPTS} (missing; the health monitor re-applies them)"
+        fi
+        kv "RPS CPU mask" "$(cat "/sys/class/net/${dev}/queues/rx-0/rps_cpus" 2>/dev/null || echo '-')"
     fi
     kv "Service" "$(systemctl is-active "$unit" 2>/dev/null || true) / $(systemctl is-enabled "$unit" 2>/dev/null || true)"
     if [[ -r ${stats_dir}/rx_bytes ]]; then
@@ -1257,12 +1411,13 @@ cmd_status() {
     echo
 }
 
-# Largest ICMP payload that reaches IP without fragmentation, or empty.
+# Largest ICMP payload that reaches IP without fragmentation, or empty. Each size gets
+# two tries, so one lost packet (common on Iranian links) does not shrink the result.
 find_pmtu_payload() {
     local ip=$1 lo=$2 hi=$3 mid best=""
     while ((lo <= hi)); do
         mid=$(((lo + hi) / 2))
-        if ping -c1 -W1 -M "do" -s "$mid" "$ip" &>/dev/null; then
+        if ping -c2 -i0.2 -W1 -M "do" -s "$mid" "$ip" &>/dev/null; then
             best=$mid
             lo=$((mid + 1))
         else
@@ -1288,10 +1443,10 @@ cmd_test() {
         kv "Tunnel IPv6 RTT" "$(ping_ms "${T[REMOTE_TUN_IP6]}" 3)"
     fi
 
-    info "Discovering path MTU (this takes a few seconds) ..."
+    info "Discovering path MTU (this takes 10-20 seconds) ..."
     payload=$(find_pmtu_payload "${T[REMOTE_IP]}" 1200 1472)
     if [[ -n $payload ]]; then
-        kv "Underlay PMTU" "$((payload + 28))  ->  recommended tunnel MTU $((payload + 28 - 24))"
+        kv "Underlay PMTU" "$((payload + 28))  ->  recommended tunnel MTU $((payload + 28 - $(gre_overhead "${T[GRE_KEY]}")))"
     else
         kv "Underlay PMTU" "unknown (ICMP blocked?)"
     fi
@@ -1310,27 +1465,46 @@ cmd_test() {
 
 # Health check run by gre-manager-monitor.timer.
 cmd_monitor() {
-    local name fails fail_file
+    local name dev state fails fail_file ping_file
     mkdir -p "$STATE_DIR"
     for name in $(tunnel_names); do
         tunnel_load "$name"
         systemctl is-enabled --quiet "$(unit_name "$name")" 2>/dev/null || continue
         leak_guard add
+        dev=$(dev_name "$name")
+        state=$(tunnel_state "$name")
         # "ufw reload", iptables-restore or anti-abuse scripts may wipe or outrank our rules.
-        if [[ $(tunnel_state "$name") == up ]] && ! fw_intact; then
+        if [[ $state == up ]] && ! fw_intact; then
             log WARN "monitor: firewall rules of ${name} were removed or outranked; re-applying"
             fw_apply || log ERROR "monitor: re-applying firewall rules of ${name} failed"
         fi
+        # A link bounce or a re-added address recreates the route without ROUTE_OPTS.
+        if [[ $state == up ]] && ! route_tune_intact "$dev"; then
+            log WARN "monitor: route options of ${name} were lost; re-applying"
+            route_tune_apply "$dev"
+        fi
         [[ ${T[MONITOR]} == yes ]] || continue
         fail_file="${STATE_DIR}/${name}.fails"
+        ping_file="${STATE_DIR}/${name}.peer-pings"
         if ping -c "$MONITOR_PING_COUNT" -W 2 -q "${T[REMOTE_TUN_IP]}" &>/dev/null; then
             rm -f "$fail_file"
+            # Learn once per boot whether the peer answers ping on its public IP; the
+            # restart decision below uses that to tell an outage from a broken tunnel.
+            if [[ ! -e $ping_file ]] && ping -c 1 -W 2 -q "${T[REMOTE_IP]}" &>/dev/null; then
+                touch "$ping_file"
+            fi
             continue
         fi
         fails=$(($(cat "$fail_file" 2>/dev/null || echo 0) + 1))
         echo "$fails" >"$fail_file"
         log WARN "monitor: ${name} unreachable (${fails}/${MONITOR_FAILS})"
         if ((fails >= MONITOR_FAILS)); then
+            # GRE keeps no state: when the peer's public IP is silent too, the path itself
+            # is down (often at the Iranian gateway) and recreating the tunnel cannot help.
+            if [[ -e $ping_file ]] && ! ping -c 2 -W 2 -q "${T[REMOTE_IP]}" &>/dev/null; then
+                log WARN "monitor: ${T[REMOTE_IP]} does not answer either (underlay outage); not restarting ${name}"
+                continue
+            fi
             log WARN "monitor: restarting ${name}"
             systemctl restart "$(unit_name "$name")" || log ERROR "monitor: restart of ${name} failed"
             rm -f "$fail_file"
@@ -1355,6 +1529,7 @@ monitor_set() {
 }
 
 cmd_optimize() {
+    sysctl_file_migrate
     cat >"$SYSCTL_FILE" <<EOF
 # Managed by ${APP}
 net.ipv4.ip_forward = 1
@@ -1364,11 +1539,19 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+# 32 MiB buffers allow ~750 Mbit/s per connection at 170 ms RTT.
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+# 256 KiB default receive buffer: the first advertised window is about half of it,
+# so 87380 held the tunnel routes' initrwnd (ROUTE_OPTS) to ~30 segments.
+net.ipv4.tcp_rmem = 4096 262144 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+# Keep the congestion window of connections that pause between bursts.
+net.ipv4.tcp_slow_start_after_idle = 0
+# Cap unsent data queued per socket: lower latency with BBR and less memory.
+net.ipv4.tcp_notsent_lowat = 131072
 EOF
+    rm -f "$OLD_SYSCTL_FILE"
     modprobe tcp_bbr 2>/dev/null || warn "tcp_bbr module unavailable; BBR may not be active."
     sysctl -q -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "Some kernel settings could not be applied."
     ok "Kernel tuned: $(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc), forwarding on, loose rp_filter."
@@ -1451,7 +1634,7 @@ uninstall_all() {
     done
     systemctl disable --now "${APP}-monitor.timer" >/dev/null 2>&1 || true
     abuse_guard_clear
-    rm -f "$UNIT_TEMPLATE" "$MONITOR_SERVICE" "$MONITOR_TIMER" "$SYSCTL_FILE" "$INSTALL_PATH"
+    rm -f "$UNIT_TEMPLATE" "$MONITOR_SERVICE" "$MONITOR_TIMER" "$SYSCTL_FILE" "$OLD_SYSCTL_FILE" "$INSTALL_PATH"
     systemctl daemon-reload
     if [[ $purge == yes ]]; then
         rm -rf "$CONF_DIR" "$BACKUP_DIR"
@@ -1549,9 +1732,9 @@ ui_add() {
     ask local_ip "This server's public IPv4" "$def_ip" is_ipv4
     ask remote_ip "${peer_role^} server's public IPv4" "" is_ipv4
     [[ $remote_ip != "$local_ip" ]] || die "Peer IP must differ from this server's IP."
-    ask mtu "MTU" "$DEFAULT_MTU" is_mtu
     ask key "GRE key (number, or 'none'; needed for several tunnels between the same two servers)" none is_gre_key_opt
     [[ $key == none ]] && key=""
+    ask mtu "MTU" "$(default_mtu "$key")" is_mtu
 
     T=()
     T[NAME]=$name T[ROLE]=$role T[ID]=$id T[LOCAL_IP]=$local_ip T[REMOTE_IP]=$remote_ip
@@ -1621,6 +1804,10 @@ ui_edit() {
             5)
                 ask value "GRE key (number or 'none')" "${T[GRE_KEY]:-none}" is_gre_key_opt
                 [[ $value == none ]] && value=""
+                # A key takes 4 header bytes: keep a default MTU in step with it.
+                if [[ ${T[MTU]} == "$(default_mtu "${T[GRE_KEY]}")" ]]; then
+                    T[MTU]=$(default_mtu "$value")
+                fi
                 T[GRE_KEY]=$value
                 ;;
             6) toggle IPV6 ;;
