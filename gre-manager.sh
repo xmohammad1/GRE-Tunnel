@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="2.2.0"
+readonly VERSION="2.2.1"
 readonly APP="gre-manager"
 readonly INSTALL_PATH="/usr/local/bin/${APP}"
 readonly CONF_DIR="/etc/${APP}"
@@ -196,6 +196,7 @@ is_tunnel_id() { is_uint "$1" && [[ $((10#$1)) -ge 1 && $((10#$1)) -le 254 ]]; }
 is_gre_key()   { is_uint "$1" && [[ ${#1} -le 10 && $((10#$1)) -ge 1 && $((10#$1)) -le 4294967295 ]]; }
 is_gre_key_opt() { [[ $1 == none ]] || is_gre_key "$1"; }
 is_role_choice() { [[ $1 == 1 || $1 == 2 ]]; }
+is_ping_count() { is_uint "$1" && [[ ${#1} -le 4 && $((10#$1)) -ge 1 && $((10#$1)) -le 1000 ]]; }
 
 # Tunnel names become part of the device name (gre-<name>, max 15 chars).
 is_valid_name() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}$ ]]; }
@@ -1121,6 +1122,23 @@ ping_ms() {
     awk -F'/' '/^(rtt|round-trip)/ { printf "%.1f ms\n", $5 }' <<<"$out"
 }
 
+# ping_stats IP COUNT — sends COUNT pings 0.1 s apart and prints "<loss%> <avg ms>",
+# e.g. "5 42.3" or "100 -". Prints nothing when ping could not run at all.
+ping_stats() {
+    local out
+    out=$(LC_ALL=C ping -c "$2" -i 0.1 -W 1 -q "$1" 2>/dev/null) || true
+    awk '
+        / packets transmitted, / {
+            for (i = 1; i <= NF; i++) if ($i ~ /%$/) loss = substr($i, 1, length($i) - 1) + 0
+        }
+        /^(rtt|round-trip)/ { split($0, p, "= "); split(p[2], v, "/"); avg = sprintf("%.1f", v[2]) }
+        END {
+            if (loss == "") exit
+            printf (loss == int(loss) ? "%d %s\n" : "%.1f %s\n"), loss, (avg == "" ? "-" : avg)
+        }
+    ' <<<"$out"
+}
+
 # =============================================================================
 #  Commands shared by the CLI and the menu
 # =============================================================================
@@ -1182,29 +1200,78 @@ peer_command() {
     echo
 }
 
+# cmd_list [-c COUNT] — every tunnel that is up gets COUNT pings (default 20) for
+# latency and packet loss. All tunnels are pinged at once, so the list takes about
+# COUNT/10 seconds however many tunnels there are.
 cmd_list() {
-    local name state color latency
+    local count=20 name state color latency loss loss_color avg result up=0
     local -a names fwd
+    local -A states=() stats=()
+    while (($# > 0)); do
+        case $1 in
+            -c | --count) need_arg "$1" "${2:-}" && count=$2 && shift ;;
+            *) die "Unknown option for list: $1" ;;
+        esac
+        shift
+    done
+    is_ping_count "$count" || die "Ping count must be 1-1000."
+    count=$((10#$count))
     mapfile -t names < <(tunnel_names)
     if ((${#names[@]} == 0)); then
         info "No tunnels configured yet."
         return 0
     fi
-    printf '\n  %s%-12s %-7s %-4s %-16s %-17s %-8s %-10s %s%s\n' "$C_BOLD" \
-        NAME ROLE ID REMOTE_IP INNER_PEER STATE LATENCY FWD "$C_RESET"
+    for name in "${names[@]}"; do
+        states[$name]=$(tunnel_state "$name")
+        [[ ${states[$name]} == up ]] && up=$((up + 1))
+    done
+    if ((up > 0)); then
+        printf '\n  %sMeasuring latency and packet loss (%d pings per tunnel) ...%s\n' \
+            "$C_DIM" "$count" "$C_RESET" >&2
+        while read -r name result; do
+            stats[$name]=$result
+        done < <(
+            for name in "${names[@]}"; do
+                [[ ${states[$name]} == up ]] || continue
+                { printf '%s %s\n' "$name" "$(ping_stats "$(conf_get "$name" REMOTE_TUN_IP)" "$count")"; } &
+            done
+            wait
+        )
+    fi
+
+    printf '\n  %s%-12s %-7s %-4s %-16s %-17s %-8s %-10s %-6s %s%s\n' "$C_BOLD" \
+        NAME ROLE ID REMOTE_IP INNER_PEER STATE LATENCY LOSS FWD "$C_RESET"
     for name in "${names[@]}"; do
         tunnel_load "$name"
-        state=$(tunnel_state "$name")
-        latency="-"
+        state=${states[$name]}
+        latency="-" loss="-" avg="-" loss_color=""
         case $state in
-            up) color=$C_GREEN latency=$(ping_ms "${T[REMOTE_TUN_IP]}") ;;
+            up) color=$C_GREEN ;;
             down) color=$C_YELLOW ;;
             *) color=$C_RED ;;
         esac
-        [[ $latency == "-" && $state == up ]] && color=$C_YELLOW state=no-ping
+        if [[ $state == up ]]; then
+            [[ -n ${stats[$name]:-} ]] && read -r loss avg <<<"${stats[$name]}"
+            if [[ $avg == "-" ]]; then
+                color=$C_YELLOW state=no-ping
+            else
+                latency="${avg} ms"
+            fi
+            if [[ $loss != "-" ]]; then
+                if [[ $loss == 0 ]]; then
+                    loss_color=$C_GREEN
+                elif ((${loss%.*} < 10)); then
+                    loss_color=$C_YELLOW
+                else
+                    loss_color=$C_RED
+                fi
+                loss+="%"
+            fi
+        fi
         read -r -a fwd <<<"${T[FORWARDS]}"
-        printf '  %-12s %-7s %-4s %-16s %-17s %s%-8s%s %-10s %s\n' "$name" "${T[ROLE]}" "${T[ID]}" \
-            "${T[REMOTE_IP]}" "${T[REMOTE_TUN_IP]}" "$color" "$state" "$C_RESET" "$latency" "${#fwd[@]}"
+        printf '  %-12s %-7s %-4s %-16s %-17s %s%-8s%s %-10s %s%-6s%s %s\n' "$name" "${T[ROLE]}" "${T[ID]}" \
+            "${T[REMOTE_IP]}" "${T[REMOTE_TUN_IP]}" "$color" "$state" "$C_RESET" "$latency" \
+            "$loss_color" "$loss" "$C_RESET" "${#fwd[@]}"
     done
     echo
 }
@@ -1896,7 +1963,8 @@ Without a command the interactive menu starts.
 
 Tunnels
   add [options]                  Create a tunnel non-interactively (see below)
-  list                           List tunnels with live state and latency
+  list [-c N]                    List tunnels with live state, latency and packet loss
+                                 (N pings per tunnel, default 20, all tunnels at once)
   status [name]                  Details of one tunnel (all when omitted)
   restart <name|--all>           Restart tunnel(s)
   remove <name|--all>            Delete tunnel(s)
@@ -2083,7 +2151,7 @@ main() {
     case $cmd in
         menu) main_menu ;;
         add) cmd_add "$@" ;;
-        list | ls) cmd_list ;;
+        list | ls) cmd_list "$@" ;;
         status)
             if [[ -n ${1:-} ]]; then
                 need_tunnel "$1"
