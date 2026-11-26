@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="2.3.2"
+readonly VERSION="2.3.3"
 readonly APP="gre-manager"
 readonly INSTALL_PATH="/usr/local/bin/${APP}"
 readonly CONF_DIR="/etc/${APP}"
@@ -1372,17 +1372,47 @@ peer_command() {
     echo
 }
 
-# cmd_list [-c COUNT | -t TIME] — pings every tunnel that is up, all at once and 10
-# times a second, for latency and packet loss: 20 pings by default (~2 s), COUNT
-# pings, or for TIME (90s, 5m, 1h). Ctrl-C stops the pings early, and the table
-# shows what they measured until then.
+# probe_cells "LOSS AVG" — sets the caller's cell_rtt, cell_loss and cell_color from
+# one ping_stats result ("-" when there is none). Loss is green at 0%, yellow below
+# 10% and red from 10%.
+probe_cells() {
+    local loss="-" avg="-" whole
+    if [[ -n ${1:-} ]]; then
+        read -r loss avg <<<"$1"
+        avg=${avg:--}
+    fi
+    cell_rtt="-" cell_loss="-" cell_color=""
+    if [[ $avg != "-" ]]; then
+        cell_rtt="${avg} ms"
+    fi
+    if [[ $loss != "-" ]]; then
+        whole=${loss#<}
+        whole=${whole%.*}
+        if [[ $loss == 0 ]]; then
+            cell_color=$C_GREEN
+        elif ((whole < 10)); then
+            cell_color=$C_YELLOW
+        else
+            cell_color=$C_RED
+        fi
+        cell_loss="${loss}%"
+    fi
+}
+
+# cmd_list [-d] [-c COUNT | -t TIME] — pings every tunnel that is up, all at once
+# and 10 times a second, for latency and packet loss: 20 pings by default (~2 s),
+# COUNT pings, or for TIME (90s, 5m, 1h). With -d each server's public IP is pinged
+# too, directly and at the same time, to tell a lossy tunnel from a lossy path.
+# Ctrl-C stops the pings early, and the table shows what they measured until then.
 cmd_list() {
-    local count=20 name state color latency loss loss_color whole avg result up=0
+    local count=20 direct=0 name state color ip key result probe what no_reply=0
+    local latency loss loss_color cell_rtt cell_loss cell_color
     local tmp pid start elapsed total took planned shown=-1 live=0 stopped=0
-    local -a names fwd
-    local -A states=() stats=()
+    local -a names probes fwd
+    local -A states=() stats=() seen=()
     while (($# > 0)); do
         case $1 in
+            -d | --direct) direct=1 ;;
             -c | --count)
                 need_arg "$1" "${2:-}"
                 is_ping_count "$2" || die "Ping count must be 1-36000."
@@ -1404,12 +1434,23 @@ cmd_list() {
         info "No tunnels configured yet."
         return 0
     fi
+    # One probe ("key address") per tunnel that is up, and with -d one per distinct
+    # public IP, whatever the tunnel state.
     for name in "${names[@]}"; do
         states[$name]=$(tunnel_state "$name")
-        [[ ${states[$name]} == up ]] && up=$((up + 1))
+        if [[ ${states[$name]} == up ]]; then
+            probes+=("t:${name} $(conf_get "$name" REMOTE_TUN_IP)")
+        fi
+        if ((direct)); then
+            ip=$(conf_get "$name" REMOTE_IP)
+            if [[ -n $ip && -z ${seen[$ip]:-} ]]; then
+                seen[$ip]=1
+                probes+=("d:${ip} ${ip}")
+            fi
+        fi
     done
 
-    if ((up > 0)); then
+    if ((${#probes[@]} > 0)); then
         total=$(((count + 9) / 10))
         printf -v planned '%d:%02d' $((total / 60)) $((total % 60))
         tmp=$(mktemp)
@@ -1417,9 +1458,8 @@ cmd_list() {
             # On Ctrl-C only ping may stop (it prints its statistics on SIGINT);
             # the shells that collect those statistics must keep running.
             trap '' INT
-            for name in "${names[@]}"; do
-                [[ ${states[$name]} == up ]] || continue
-                { printf '%s %s\n' "$name" "$(ping_stats "$(conf_get "$name" REMOTE_TUN_IP)" "$count")"; } &
+            for probe in "${probes[@]}"; do
+                { printf '%s %s\n' "${probe%% *}" "$(ping_stats "${probe#* }" "$count")"; } &
             done
             wait
         ) >"$tmp" &
@@ -1431,8 +1471,12 @@ cmd_list() {
             live=1
             echo >&2
         else
-            printf '\n  %sMeasuring latency and packet loss (%d pings per tunnel) ...%s\n' \
-                "$C_DIM" "$count" "$C_RESET" >&2
+            what="per tunnel"
+            if ((direct)); then
+                what+=" and per public IP"
+            fi
+            printf '\n  %sMeasuring latency and packet loss (%d pings %s) ...%s\n' \
+                "$C_DIM" "$count" "$what" "$C_RESET" >&2
         fi
         while kill -0 "$pid" 2>/dev/null; do
             elapsed=$((SECONDS - start))
@@ -1453,48 +1497,51 @@ cmd_list() {
         if ((stopped)); then
             warn "Stopped after ${took}; the results cover the pings sent until then."
         fi
-        while read -r name result; do
-            stats[$name]=$result
+        while read -r key result; do
+            stats[$key]=$result
         done <"$tmp"
         rm -f "$tmp"
     fi
 
-    printf '\n  %s%-12s %-7s %-4s %-16s %-17s %-8s %-10s %-6s %s%s\n' "$C_BOLD" \
-        NAME ROLE ID REMOTE_IP INNER_PEER STATE LATENCY LOSS FWD "$C_RESET"
+    if ((direct)); then
+        printf '\n  %s%-12s %-16s %-8s %-10s %-7s %-10s %s%s\n' "$C_BOLD" \
+            NAME REMOTE_IP STATE TUNNEL LOSS DIRECT LOSS "$C_RESET"
+    else
+        printf '\n  %s%-12s %-7s %-4s %-16s %-17s %-8s %-10s %-6s %s%s\n' "$C_BOLD" \
+            NAME ROLE ID REMOTE_IP INNER_PEER STATE LATENCY LOSS FWD "$C_RESET"
+    fi
     for name in "${names[@]}"; do
         tunnel_load "$name"
         state=${states[$name]}
-        latency="-" loss="-" avg="-" loss_color=""
         case $state in
             up) color=$C_GREEN ;;
             down) color=$C_YELLOW ;;
             *) color=$C_RED ;;
         esac
-        if [[ $state == up ]]; then
-            [[ -n ${stats[$name]:-} ]] && read -r loss avg <<<"${stats[$name]}"
-            if [[ $avg == "-" ]]; then
-                color=$C_YELLOW state=no-ping
-            else
-                latency="${avg} ms"
-            fi
-            if [[ $loss != "-" ]]; then
-                whole=${loss#<}
-                whole=${whole%.*}
-                if [[ $loss == 0 ]]; then
-                    loss_color=$C_GREEN
-                elif ((whole < 10)); then
-                    loss_color=$C_YELLOW
-                else
-                    loss_color=$C_RED
-                fi
-                loss+="%"
-            fi
+        probe_cells "${stats[t:$name]:-}"
+        if [[ $state == up && $cell_rtt == "-" ]]; then
+            color=$C_YELLOW state=no-ping
         fi
-        read -r -a fwd <<<"${T[FORWARDS]}"
-        printf '  %-12s %-7s %-4s %-16s %-17s %s%-8s%s %-10s %s%-6s%s %s\n' "$name" "${T[ROLE]}" "${T[ID]}" \
-            "${T[REMOTE_IP]}" "${T[REMOTE_TUN_IP]}" "$color" "$state" "$C_RESET" "$latency" \
-            "$loss_color" "$loss" "$C_RESET" "${#fwd[@]}"
+        if ((direct)); then
+            latency=$cell_rtt loss=$cell_loss loss_color=$cell_color
+            probe_cells "${stats[d:${T[REMOTE_IP]}]:-}"
+            if [[ $cell_rtt == "-" ]]; then
+                no_reply=1
+            fi
+            printf '  %-12s %-16s %s%-8s%s %-10s %s%-7s%s %-10s %s%s%s\n' "$name" "${T[REMOTE_IP]}" \
+                "$color" "$state" "$C_RESET" "$latency" "$loss_color" "$loss" "$C_RESET" \
+                "$cell_rtt" "$cell_color" "$cell_loss" "$C_RESET"
+        else
+            read -r -a fwd <<<"${T[FORWARDS]}"
+            printf '  %-12s %-7s %-4s %-16s %-17s %s%-8s%s %-10s %s%-6s%s %s\n' "$name" "${T[ROLE]}" "${T[ID]}" \
+                "${T[REMOTE_IP]}" "${T[REMOTE_TUN_IP]}" "$color" "$state" "$C_RESET" "$cell_rtt" \
+                "$cell_color" "$cell_loss" "$C_RESET" "${#fwd[@]}"
+        fi
     done
+    if ((no_reply)); then
+        printf '\n  %sNo reply from a public IP often just means that server or its provider blocks ping.%s\n' \
+            "$C_DIM" "$C_RESET"
+    fi
     echo
 }
 
@@ -1811,16 +1858,24 @@ run_subshell() {
     ((rc == 0)) || warn "Action finished with errors (exit ${rc})."
 }
 
-# Menu option 2: the quick list; "L" then runs a longer packet loss test.
+# Menu option 2: the quick list; then "L" runs a longer packet loss test, and "D"
+# one that also pings the servers' public IPs directly, outside the tunnels.
 ui_list() {
     local key="" duration
     run_subshell cmd_list
     [[ -t 0 ]] || return 0
-    read -r -s -n1 -p "${C_DIM}Press L for a longer packet loss test, any other key to continue...${C_RESET}" key || true
+    read -r -s -n1 -p "${C_DIM}Press L for a longer test, D to also ping the public IPs directly, any other key to continue...${C_RESET}" key || true
     echo
-    [[ ${key,,} == l ]] || return 0
+    case ${key,,} in
+        l | d) ;;
+        *) return 0 ;;
+    esac
     ask duration "Test time (e.g. 90s, 5m, 1h)" 5m is_duration || return 0
-    run_action cmd_list -t "$duration"
+    if [[ ${key,,} == d ]]; then
+        run_action cmd_list -d -t "$duration"
+    else
+        run_action cmd_list -t "$duration"
+    fi
 }
 
 # select_tunnel VAR [allow_all]  — VAR receives a name, or '*' for all.
@@ -2243,11 +2298,12 @@ Without a command the interactive menu starts.
 
 Tunnels
   add [options]                  Create a tunnel non-interactively (see below)
-  list [-c N | -t TIME]          List tunnels with live state, latency and packet loss.
+  list [-d] [-c N | -t TIME]     List tunnels with live state, latency and packet loss.
                                  All tunnels are pinged at once, 10 times a second:
                                  20 pings by default (~2 s), N pings, or for TIME
-                                 (90s, 5m, 1h; at most 1h). Ctrl-C stops early and
-                                 shows the results so far.
+                                 (90s, 5m, 1h; at most 1h). -d also pings each
+                                 server's public IP directly, outside the tunnel.
+                                 Ctrl-C stops early and shows the results so far.
   status [name]                  Details of one tunnel (all when omitted)
   restart <name|--all>           Restart tunnel(s)
   remove <name|--all>            Delete tunnel(s)
