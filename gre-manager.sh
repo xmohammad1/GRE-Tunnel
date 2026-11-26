@@ -202,7 +202,24 @@ is_tunnel_id() { is_uint "$1" && [[ $((10#$1)) -ge 1 && $((10#$1)) -le 254 ]]; }
 is_gre_key()   { is_uint "$1" && [[ ${#1} -le 10 && $((10#$1)) -ge 1 && $((10#$1)) -le 4294967295 ]]; }
 is_gre_key_opt() { [[ $1 == none ]] || is_gre_key "$1"; }
 is_role_choice() { [[ $1 == 1 || $1 == 2 ]]; }
-is_ping_count() { is_uint "$1" && [[ ${#1} -le 4 && $((10#$1)) -ge 1 && $((10#$1)) -le 1000 ]]; }
+is_ping_count() { is_uint "$1" && [[ ${#1} -le 5 && $((10#$1)) -ge 1 && $((10#$1)) -le 36000 ]]; }
+
+# Prints the seconds of a duration such as 90, 90s, 5m or 1h; fails when invalid.
+duration_seconds() {
+    [[ ${1,,} =~ ^([0-9]{1,4})([smh]?)$ ]] || return 1
+    local n=$((10#${BASH_REMATCH[1]}))
+    case ${BASH_REMATCH[2]} in
+        m) n=$((n * 60)) ;;
+        h) n=$((n * 3600)) ;;
+    esac
+    echo "$n"
+}
+
+# Packet loss test time: 1 s to 1 h.
+is_duration() {
+    local s
+    s=$(duration_seconds "$1") && [[ $s -ge 1 && $s -le 3600 ]]
+}
 
 # Tunnel names become part of the device name (gre-<name>, max 15 chars).
 is_valid_name() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}$ ]]; }
@@ -1269,7 +1286,8 @@ ping_ms() {
 }
 
 # ping_stats IP COUNT — sends COUNT pings 0.1 s apart and prints "<loss%> <avg ms>",
-# e.g. "5 42.3" or "100 -". Prints nothing when ping could not run at all.
+# e.g. "5 42.3", "0.03 41.9" or "100 -". Prints nothing when ping could not run.
+# On Ctrl-C ping stops early and still prints its statistics.
 ping_stats() {
     local out
     out=$(LC_ALL=C ping -c "$2" -i 0.1 -W 1 -q "$1" 2>/dev/null) || true
@@ -1280,7 +1298,15 @@ ping_stats() {
         /^(rtt|round-trip)/ { split($0, p, "= "); split(p[2], v, "/"); avg = sprintf("%.1f", v[2]) }
         END {
             if (loss == "") exit
-            printf (loss == int(loss) ? "%d %s\n" : "%.1f %s\n"), loss, (avg == "" ? "-" : avg)
+            if (loss == int(loss)) {
+                s = sprintf("%d", loss)
+            } else {
+                # Truncated, not rounded: 99.97 must not read 100, nor 0.003 read 0.
+                t = int(loss * 100 + 1e-6) / 100
+                if (t == 0) s = "<0.01"
+                else { s = sprintf("%.2f", t); sub(/0+$/, "", s); sub(/\.$/, "", s) }
+            }
+            printf "%s %s\n", s, (avg == "" ? "-" : avg)
         }
     ' <<<"$out"
 }
@@ -1346,22 +1372,33 @@ peer_command() {
     echo
 }
 
-# cmd_list [-c COUNT] — every tunnel that is up gets COUNT pings (default 20) for
-# latency and packet loss. All tunnels are pinged at once, so the list takes about
-# COUNT/10 seconds however many tunnels there are.
+# cmd_list [-c COUNT | -t TIME] — pings every tunnel that is up, all at once and 10
+# times a second, for latency and packet loss: 20 pings by default (~2 s), COUNT
+# pings, or for TIME (90s, 5m, 1h). Ctrl-C stops the pings early, and the table
+# shows what they measured until then.
 cmd_list() {
-    local count=20 name state color latency loss loss_color avg result up=0
+    local count=20 name state color latency loss loss_color whole avg result up=0
+    local tmp pid start elapsed total took planned shown=-1 live=0 stopped=0
     local -a names fwd
     local -A states=() stats=()
     while (($# > 0)); do
         case $1 in
-            -c | --count) need_arg "$1" "${2:-}" && count=$2 && shift ;;
+            -c | --count)
+                need_arg "$1" "${2:-}"
+                is_ping_count "$2" || die "Ping count must be 1-36000."
+                count=$((10#$2))
+                shift
+                ;;
+            -t | --time)
+                need_arg "$1" "${2:-}"
+                is_duration "$2" || die "Test time must be 1s to 1h, e.g. 90s, 5m or 1h."
+                count=$(($(duration_seconds "$2") * 10))
+                shift
+                ;;
             *) die "Unknown option for list: $1" ;;
         esac
         shift
     done
-    is_ping_count "$count" || die "Ping count must be 1-1000."
-    count=$((10#$count))
     mapfile -t names < <(tunnel_names)
     if ((${#names[@]} == 0)); then
         info "No tunnels configured yet."
@@ -1371,18 +1408,55 @@ cmd_list() {
         states[$name]=$(tunnel_state "$name")
         [[ ${states[$name]} == up ]] && up=$((up + 1))
     done
+
     if ((up > 0)); then
-        printf '\n  %sMeasuring latency and packet loss (%d pings per tunnel) ...%s\n' \
-            "$C_DIM" "$count" "$C_RESET" >&2
-        while read -r name result; do
-            stats[$name]=$result
-        done < <(
+        total=$(((count + 9) / 10))
+        printf -v planned '%d:%02d' $((total / 60)) $((total % 60))
+        tmp=$(mktemp)
+        (
+            # On Ctrl-C only ping may stop (it prints its statistics on SIGINT);
+            # the shells that collect those statistics must keep running.
+            trap '' INT
             for name in "${names[@]}"; do
                 [[ ${states[$name]} == up ]] || continue
                 { printf '%s %s\n' "$name" "$(ping_stats "$(conf_get "$name" REMOTE_TUN_IP)" "$count")"; } &
             done
             wait
-        )
+        ) >"$tmp" &
+        pid=$!
+        start=$SECONDS
+        # Ctrl-C reaches the pings as well: they stop and print what they measured.
+        trap 'stopped=1' INT
+        if ((total > 10)) && [[ -t 2 ]]; then
+            live=1
+            echo >&2
+        else
+            printf '\n  %sMeasuring latency and packet loss (%d pings per tunnel) ...%s\n' \
+                "$C_DIM" "$count" "$C_RESET" >&2
+        fi
+        while kill -0 "$pid" 2>/dev/null; do
+            elapsed=$((SECONDS - start))
+            if ((live && elapsed != shown)); then
+                shown=$elapsed
+                printf '\r  %sMeasuring latency and packet loss: %d:%02d / %s  (Ctrl-C stops early)%s' \
+                    "$C_DIM" $((elapsed / 60)) $((elapsed % 60)) "$planned" "$C_RESET" >&2
+            fi
+            sleep 0.2 || true
+        done
+        wait "$pid" 2>/dev/null || true
+        trap - INT
+        elapsed=$((SECONDS - start))
+        printf -v took '%d:%02d' $((elapsed / 60)) $((elapsed % 60))
+        if ((live)); then
+            printf '\r\e[K  %sMeasured latency and packet loss for %s%s\n' "$C_DIM" "$took" "$C_RESET" >&2
+        fi
+        if ((stopped)); then
+            warn "Stopped after ${took}; the results cover the pings sent until then."
+        fi
+        while read -r name result; do
+            stats[$name]=$result
+        done <"$tmp"
+        rm -f "$tmp"
     fi
 
     printf '\n  %s%-12s %-7s %-4s %-16s %-17s %-8s %-10s %-6s %s%s\n' "$C_BOLD" \
@@ -1404,9 +1478,11 @@ cmd_list() {
                 latency="${avg} ms"
             fi
             if [[ $loss != "-" ]]; then
+                whole=${loss#<}
+                whole=${whole%.*}
                 if [[ $loss == 0 ]]; then
                     loss_color=$C_GREEN
-                elif ((${loss%.*} < 10)); then
+                elif ((whole < 10)); then
                     loss_color=$C_YELLOW
                 else
                     loss_color=$C_RED
@@ -1718,6 +1794,12 @@ uninstall_all() {
 
 # Runs a menu action in a subshell so that a failure returns to the menu.
 run_action() {
+    run_subshell "$@"
+    pause
+}
+
+# Runs "$@" in a subshell with errexit, and warns when it fails.
+run_subshell() {
     local rc
     set +e
     (
@@ -1727,7 +1809,18 @@ run_action() {
     rc=$?
     set -e
     ((rc == 0)) || warn "Action finished with errors (exit ${rc})."
-    pause
+}
+
+# Menu option 2: the quick list; "L" then runs a longer packet loss test.
+ui_list() {
+    local key="" duration
+    run_subshell cmd_list
+    [[ -t 0 ]] || return 0
+    read -r -s -n1 -p "${C_DIM}Press L for a longer packet loss test, any other key to continue...${C_RESET}" key || true
+    echo
+    [[ ${key,,} == l ]] || return 0
+    ask duration "Test time (e.g. 90s, 5m, 1h)" 5m is_duration || return 0
+    run_action cmd_list -t "$duration"
 }
 
 # select_tunnel VAR [allow_all]  — VAR receives a name, or '*' for all.
@@ -2117,7 +2210,7 @@ main_menu() {
         read -r -p "  Select: " choice || exit 0
         case $choice in
             1) run_action ui_add ;;
-            2) run_action cmd_list ;;
+            2) ui_list ;;
             3) run_action ui_details ;;
             4) run_action ui_edit ;;
             5) run_action ui_remove ;;
@@ -2150,8 +2243,11 @@ Without a command the interactive menu starts.
 
 Tunnels
   add [options]                  Create a tunnel non-interactively (see below)
-  list [-c N]                    List tunnels with live state, latency and packet loss
-                                 (N pings per tunnel, default 20, all tunnels at once)
+  list [-c N | -t TIME]          List tunnels with live state, latency and packet loss.
+                                 All tunnels are pinged at once, 10 times a second:
+                                 20 pings by default (~2 s), N pings, or for TIME
+                                 (90s, 5m, 1h; at most 1h). Ctrl-C stops early and
+                                 shows the results so far.
   status [name]                  Details of one tunnel (all when omitted)
   restart <name|--all>           Restart tunnel(s)
   remove <name|--all>            Delete tunnel(s)
@@ -2334,7 +2430,8 @@ main() {
     esac
 
     bootstrap
-    acquire_lock
+    # "list" only reads, so a long packet loss test does not lock out other commands.
+    [[ $cmd == list || $cmd == ls ]] || acquire_lock
     case $cmd in
         menu) main_menu ;;
         add) cmd_add "$@" ;;
