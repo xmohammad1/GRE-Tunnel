@@ -104,7 +104,7 @@ proto:port[-port][>target_port]      proto = tcp | udp | both
 | دستور | کار |
 |---|---|
 | `gre-manager` | منوی تعاملی |
-| `gre-manager list` | لیست تانل‌ها با وضعیت و latency |
+| `gre-manager list [-c N]` | لیست تانل‌ها با وضعیت، latency و packet loss (همه تانل‌ها هم‌زمان پینگ می‌شوند؛ N پینگ برای هر تانل، پیش‌فرض ۲۰ ≈ ۲ ثانیه) |
 | `gre-manager status [name]` | جزئیات تانل (ترافیک، سرویس، فورواردها) |
 | `gre-manager test <name>` | تست پینگ، packet loss و MTU |
 | `gre-manager restart <name\|--all>` | ری‌استارت تانل |
